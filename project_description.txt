@@ -1,0 +1,217 @@
+I am creating an application that will give weather alerts and weather data to sailors.  The weather data comes from the NOAA.
+
+
+The NOAA provides weather and forecast every 6 hours (synoptic time computations: 00, 06, 12, 18).  At every synoptic time, there will be 364 forecasts made. Let's assume we want every 6h starting at the 12z run for the next 24h for example.  Thus we want 12zf000, 12zf006, 12zf0012, 12zf0018, and 12zf0024. This is 5 files and we have to ask for these individually.
+
+The data comes as a grib file and can be obtained using the following example code:
+
+import requests
+from datetime import datetime
+from dotenv import load_dotenv
+import os
+import gpxpy
+import pytz
+
+
+load_dotenv()
+
+
+import requests
+from bs4 import BeautifulSoup
+from datetime import datetime
+
+
+def get_latest_cycle(formatted_date):
+   base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+   url = f"{base_url}?dir=%2Fgfs.{formatted_date}"
+
+
+   try:
+       response = requests.get(url)
+       response.raise_for_status()  # Raises an HTTPError if the response status code is 4XX/5XX
+   except requests.RequestException as e:
+       raise Exception(f"Request to NOAA failed: {e}")
+
+
+   soup = BeautifulSoup(response.text, "html.parser")
+   cycles = [link.get("href").split("%2F")[-1] for link in soup.find_all("a") if link.get("href") and "dir=%2Fgfs" in link.get("href")]
+
+
+   if not cycles:
+       raise Exception("No cycles found for the given date.")
+
+
+   return max(cycles)  # Returns the latest cycle without needing to sort
+
+
+def get_waypoints_from_gpx(file_path):
+   waypoints = []
+   with open(file_path, 'r') as gpx_file:
+       gpx = gpxpy.parse(gpx_file)
+       for waypoint in gpx.waypoints:
+           waypoints.append((waypoint.latitude, waypoint.longitude))
+       for route in gpx.routes:
+           for point in route.points:
+               waypoints.append((point.latitude, point.longitude))
+       for track in gpx.tracks:
+           for segment in track.segments:
+               for point in segment.points:
+                   waypoints.append((point.latitude, point.longitude))
+   return waypoints
+
+
+def download_grib_file(date=None, cycle=None, forecast_hour=None, variables=None, levels=None, top_lat=90, left_lon=0, right_lon=360, bottom_lat=-90):
+   base_url = "https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl"
+
+
+   if date is None:
+       # date = datetime.utcnow().date().strftime("%Y%m%d")
+       # Define the Eastern Time Zone
+       eastern = pytz.timezone('America/New_York')
+
+
+       # Get the current time in Eastern Time Zone
+       now_eastern = datetime.now(eastern)
+
+
+       # Format the date
+       date = now_eastern.strftime("%Y%m%d")
+   if cycle is None:
+       cycle = get_latest_cycle(date)
+   if forecast_hour is None:
+       forecast_hour = "000"
+
+
+   formatted_variables = "_".join(variables) if variables else "all"
+   formatted_levels = "_".join(levels) if levels else "all"
+   formatted_coordinates = f"{top_lat}_{bottom_lat}_{left_lon}_{right_lon}"
+   output_file_name = f"gfs_0p25_{date}_{cycle}_f{forecast_hour}_{formatted_variables}_{formatted_levels}_{formatted_coordinates}.grib"
+   output_file_path = os.path.join(os.getenv("GRIB_SAVE_PATH"), output_file_name)
+
+
+   # If output_file_path file exist and we are debugging, then just immediately
+   # return output_file_path
+   if os.path.exists(output_file_path):
+           return output_file_path
+      
+
+
+
+
+   query_params = {
+       "dir": f"%2Fgfs.{date}%2F{cycle}%2Fatmos",
+       "file": f"gfs.t{cycle}z.pgrb2.0p25.f{forecast_hour}",
+   }
+
+
+   if variables is not None:
+       for var in variables:
+           query_params[f"var_{var}"] = "on"
+
+
+   if levels is not None:
+       for lev in levels:
+           query_params[f"lev_{lev}"] = "on"
+
+
+   query_params["subregion"] = ""
+   query_params["toplat"] = str(top_lat)
+   query_params["leftlon"] = str(left_lon)
+   query_params["rightlon"] = str(right_lon)
+   query_params["bottomlat"] = str(bottom_lat)
+
+
+   url = base_url + "?" + "&".join([f"{k}={v}" for k, v in query_params.items()])
+
+
+   print(f"Downloading GRIB file from {url}")
+
+
+   response = requests.get(url)
+
+
+   if response.status_code != 200:
+       error_msg = f"Error downloading the GRIB file. URL: {url}, Status code: {response.status_code}"
+       raise Exception(error_msg)
+
+
+   with open(output_file_path, "wb") as file:
+       file.write(response.content)
+   print(f"GRIB file downloaded successfully and saved as {output_file_path}")
+
+
+   return output_file_path
+
+
+
+This above code only retrieves a single grib.  We will need to have the grib file that is the forecast for every 6 hours for the next 72 hours.
+
+The weather data that we will want from the NOAA is:
+Wind:  
+Variable: UGRD, VGRD, which are the E-W and N-S components of the wind
+Level: 10_m_above_ground
+Simulated radar: 
+Variable: REFC
+Level: "entire atmosphere"
+Pressure: 
+Variable: PRMSL
+Level: "mean sea level."
+
+An example of what the url would look like, to retrieve the grib file for a specified region, is:
+https://nomads.ncep.noaa.gov/cgi-bin/filter_gfs_0p25.pl?dir=%2Fgfs.20240323%2F06%2Fatmos&file=gfs.t06z.pgrb2.0p25.anl&var_PRMSL=on&var_REFC=on&var_UGRD=on&var_VGRD=on&lev_10_m_above_ground=on&lev_mean_sea_level=on&lev_entire_atmosphere=on&subregion=&toplat=10&leftlon=0&rightlon=60&bottomlat=0
+
+
+The user (the sailor) will provide to us their waypoints, the boat’s hull speed, time of departure, and the boat’s polars.   With this data we will be able to estimate when and where the boat will be and cross reference the boat’s path with the forecasted weather.  When we find concerning weather we will update the captain (through a push notification or a text message).  We will do this initially, when the captain first uploads their information to our server, and we will look for changes every time the NOAA releases a new forecast (this is known as a new cycle and it occurs every 6 hours).  We should also expect to receive GPS coordinates from the boat so that we can have an accurate position of the boat.
+
+Once we have retrieved the grib file from the NOAA we will need to pull the relevant data from it.  The following code is an example of gathering the wind speed data from a grib file:
+
+import pygrib
+import numpy as np
+
+
+def extract(grib_path):
+   grbs = pygrib.open(grib_path)
+
+
+   wind_data = {}
+
+
+   for grb in grbs:
+       if grb.shortName == '10u':
+           wind_data['u_wind'] = grb.values
+           wind_data['lats'], wind_data['lons'] = grb.latlons()
+           print("Debug: U wind component (10u) loaded successfully.")
+           print(f"Debug: Shape of U wind component: {wind_data['u_wind'].shape}")
+           print(f"Debug: Shape of latitudes: {wind_data['lats'].shape}")
+           print(f"Debug: Shape of longitudes: {wind_data['lons'].shape}")
+       elif grb.shortName == '10v':
+           wind_data['v_wind'] = grb.values
+           print("Debug: V wind component (10v) loaded successfully.")
+           print(f"Debug: Shape of V wind component: {wind_data['v_wind'].shape}")
+
+
+   if 'u_wind' not in wind_data or 'v_wind' not in wind_data:
+       raise ValueError("U (10u) and/or V (10v) wind components not found in the GRIB file.")
+
+
+   # Calculate the wind speed and direction for each grid point
+   wind_data['wind_speed'] = np.sqrt(wind_data['u_wind']**2 + wind_data['v_wind']**2)
+   wind_data['wind_direction'] = np.arctan2(wind_data['v_wind'], wind_data['u_wind']) * 180 / np.pi
+
+
+   # Adjust wind direction to be in the range [0, 360)
+   wind_data['wind_direction'] = (wind_data['wind_direction'] + 360) % 360
+
+
+   print("Debug: Wind speed and direction calculated successfully.")
+   print(f"Debug: Shape of wind speed: {wind_data['wind_speed'].shape}")
+   print(f"Debug: Shape of wind direction: {wind_data['wind_direction'].shape}")
+
+
+   return wind_data
+
+Upon request we will provide all of the weather data to the user (the sailor) so that they can visualize the weather data using a client side application. For now we onlyare concerned
+with developing the server.  Do not worry about the client application. We can iterate with new features later.
+
+Please create a python flask server for the above requirements.  The server should be able to be run using vscode.  Add any additional features that you think are necessary. Also create a README.md file that explains the project.
+
